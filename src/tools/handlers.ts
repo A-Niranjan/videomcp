@@ -87,6 +87,166 @@ async function analyzeVideoWithGemini(videoPath: string, prompt: string): Promis
 }
 
 /**
+ * Parses the Gemini API response to extract start and end timestamps
+ * @param responseText The response from the Gemini API
+ * @returns An array of { startTime, endTime } objects
+ */
+function extractTimestampsFromResponse(responseText: string): Array<{ startTime: string, endTime: string }> {
+  const timestampRegex = /\b(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\b/g;
+  const matches = responseText.match(timestampRegex);
+  const timestamps: Array<{ startTime: string, endTime: string }> = [];
+
+  if (matches && matches.length >= 2) {
+    for (let i = 0; i < matches.length; i += 2) {
+      if (i + 1 < matches.length) {
+        timestamps.push({ startTime: matches[i], endTime: matches[i + 1] });
+      }
+    }
+  }
+
+  if (timestamps.length === 0) {
+    throw new Error("No valid timestamps found in Gemini response");
+  }
+
+  return timestamps;
+}
+
+/**
+ * Removes specified segments from a video using FFmpeg
+ * @param inputPath Path to the input video
+ * @param segments Array of segments to remove, each with startTime and endTime
+ * @param outputPath Path for the output video
+ */
+async function removeSegments(inputPath: string, segments: Array<{ startTime: string, endTime: string }>, outputPath: string) {
+  const tempFiles: string[] = [];
+  try {
+    // Sort segments by start time
+    segments.sort((a, b) => parseTimeToSeconds(a.startTime) - parseTimeToSeconds(b.startTime));
+
+    // Get video info as JSON
+    const info = await getVideoInfo(inputPath);
+    let videoInfo;
+    try {
+      videoInfo = JSON.parse(info);
+    } catch (error) {
+      throw new Error(`Failed to parse video info as JSON: ${error}`);
+    }
+
+    // Extract duration from the format section of the JSON
+    const duration = videoInfo?.format?.duration;
+    if (!duration) {
+      throw new Error("Could not determine video duration from video info");
+    }
+    const totalDuration = parseTimeToSeconds(duration).toFixed(6); // Convert to seconds if needed
+
+    // Create a list of parts to keep
+    const partsToKeep: Array<{ start: string, end: string }> = [];
+    let prevEnd = "00:00:00";
+
+    for (const segment of segments) {
+      if (parseTimeToSeconds(prevEnd) < parseTimeToSeconds(segment.startTime)) {
+        partsToKeep.push({ start: prevEnd, end: segment.startTime });
+      }
+      prevEnd = segment.endTime;
+    }
+
+    if (parseTimeToSeconds(prevEnd) < parseTimeToSeconds(totalDuration)) {
+      partsToKeep.push({ start: prevEnd, end: totalDuration });
+    }
+
+    // Extract each part to keep
+    const partPaths: string[] = [];
+    for (let i = 0; i < partsToKeep.length; i++) {
+      const partPath = `temp_part_${i}.mp4`;
+      tempFiles.push(partPath);
+      const command = `-i "${inputPath}" -ss ${partsToKeep[i].start} -to ${partsToKeep[i].end} -c copy "${partPath}" -y`;
+      await runFFmpegCommand(command);
+      partPaths.push(partPath);
+    }
+
+    // Concatenate the parts
+    if (partPaths.length > 0) {
+      const concatListPath = "temp_concat_list.txt";
+      tempFiles.push(concatListPath);
+      const concatList = partPaths.map(path => `file '${path}'`).join("\n");
+      writeFileSync(concatListPath, concatList);
+
+      const concatCommand = `-f concat -safe 0 -i "${concatListPath}" -c copy "${outputPath}" -y`;
+      await runFFmpegCommand(concatCommand);
+    } else {
+      throw new Error("No segments to keep; the entire video would be removed");
+    }
+  } finally {
+    for (const tempFile of tempFiles) {
+      if (existsSync(tempFile)) {
+        unlinkSync(tempFile);
+      }
+    }
+  }
+}
+
+/**
+ * Automatically keeps only the segment of a video where a specified event occurs
+ * @param inputPath Path to the input video
+ * @param eventDescription Description of the event to keep (e.g., "the goalkeeper saves the penalty kick")
+ * @param outputPath Path for the output video
+ */
+async function removeEventSegments(inputPath: string, eventDescription: string, outputPath: string) {
+  const validatedInputPath = validatePath(inputPath, true);
+  const validatedOutputPath = validatePath(outputPath);
+  await ensureDirectoryExists(validatedOutputPath);
+
+  try {
+    // Step 1: Analyze video with Gemini to get the timestamps of the event to KEEP
+    const prompt = `Identify the segment in the video where the following event occurs: "${eventDescription}". Provide the start and end timestamps in HH:MM:SS format for this segment. If the event spans multiple segments, provide the timestamps for the primary occurrence.`;
+    const geminiResponse = await analyzeVideoWithGemini(validatedInputPath, prompt);
+
+    // Step 2: Extract timestamps of the event to keep
+    const segmentsToKeep = extractTimestampsFromResponse(geminiResponse);
+    if (segmentsToKeep.length !== 1) {
+      throw new Error("Expected exactly one segment to keep, but found " + segmentsToKeep.length);
+    }
+    const segmentToKeep = segmentsToKeep[0];
+
+    // Step 3: Get video info to determine total duration
+    const info = await getVideoInfo(inputPath);
+    let videoInfo;
+    try {
+      videoInfo = JSON.parse(info);
+    } catch (error) {
+      throw new Error(`Failed to parse video info as JSON: ${error}`);
+    }
+    const duration = videoInfo?.format?.duration;
+    if (!duration) {
+      throw new Error("Could not determine video duration from video info");
+    }
+    const totalDuration = parseTimeToSeconds(duration).toFixed(6);
+
+    // Step 4: Create segments to remove (everything before and after the segment to keep)
+    const segmentsToRemove: Array<{ startTime: string, endTime: string }> = [];
+    if (parseTimeToSeconds("00:00:00") < parseTimeToSeconds(segmentToKeep.startTime)) {
+      segmentsToRemove.push({ startTime: "00:00:00", endTime: segmentToKeep.startTime });
+    }
+    if (parseTimeToSeconds(segmentToKeep.endTime) < parseTimeToSeconds(totalDuration)) {
+      segmentsToRemove.push({ startTime: segmentToKeep.endTime, endTime: totalDuration });
+    }
+
+    // Step 5: Remove the unwanted segments
+    if (segmentsToRemove.length > 0) {
+      await removeSegments(validatedInputPath, segmentsToRemove, validatedOutputPath);
+    } else {
+      // If no segments to remove, just copy the input to output
+      const command = `-i "${validatedInputPath}" -c copy "${validatedOutputPath}" -y`;
+      await runFFmpegCommand(command);
+    }
+
+    return `Successfully kept the segment for event "${eventDescription}" from ${inputPath}. Output saved to ${outputPath}`;
+  } catch (error: any) {
+    throw new Error(`Failed to process video: ${error.message}`);
+  }
+}
+
+/**
  * Handles all FFmpeg and Gemini tool requests
  */
 export async function handleToolCall(toolName: string, args: any) {
@@ -116,6 +276,24 @@ export async function handleToolCall(toolName: string, args: any) {
         };
       } catch (error: any) {
         throw new Error(`Failed to analyze video: ${error.message}`);
+      }
+    }
+
+    case "remove_event_segments": {
+      const inputPath = validatePath(String(args?.inputPath), true);
+      const eventDescription = String(args?.eventDescription);
+      const outputPath = validatePath(String(args?.outputPath));
+
+      try {
+        const result = await removeEventSegments(inputPath, eventDescription, outputPath);
+        return {
+          content: [{
+            type: "text",
+            text: result
+          }]
+        };
+      } catch (error: any) {
+        throw new Error(`Failed to remove event segments: ${error.message}`);
       }
     }
 
