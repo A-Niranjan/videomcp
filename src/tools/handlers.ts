@@ -3,7 +3,16 @@ import { getVideoInfo, runFFmpegCommand } from "../utils/ffmpeg.js";
 import { ensureDirectoryExists } from "../utils/file.js";
 import { join } from "path";
 import { existsSync, readdirSync, readFileSync, unlinkSync, renameSync, writeFileSync } from "fs";
+import * as dotenv from "dotenv";
+import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 
+// Load environment variables from .env file
+dotenv.config();
+
+// Initialize the Gemini API client
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "");
+
+// Helper function to parse time strings
 function parseTimeToSeconds(timeStr: string | number): number {
   if (timeStr === undefined || timeStr === null) {
     throw new Error("Time input cannot be undefined or null.");
@@ -29,7 +38,7 @@ function parseTimeToSeconds(timeStr: string | number): number {
       throw new Error(`Invalid time format: "${timeStr}". Expected HH:MM:SS.mmm, MM:SS.mmm, or a number of seconds.`);
     }
     if (isNaN(totalSeconds)) {
-        throw new Error(`Invalid time string: "${timeStr}" resulted in NaN after parsing time components.`);
+      throw new Error(`Invalid time string: "${timeStr}" resulted in NaN after parsing time components.`);
     }
     return totalSeconds;
   } else {
@@ -42,7 +51,43 @@ function parseTimeToSeconds(timeStr: string | number): number {
 }
 
 /**
- * Handles all FFmpeg tool requests
+ * Analyzes a video using the Gemini API and returns the response
+ * @param videoPath Local path to the video file
+ * @param prompt The prompt to send to the Gemini model
+ * @returns The Gemini API response as a string
+ */
+async function analyzeVideoWithGemini(videoPath: string, prompt: string): Promise<string> {
+  try {
+    // Validate the video path
+    const validatedPath = validatePath(videoPath, true);
+
+    // Initialize the Gemini model (using gemini-1.5-flash for video support)
+    const model: GenerativeModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+
+    // Read the video file as a buffer and encode it as base64
+    const videoData = readFileSync(validatedPath);
+    const base64Video = videoData.toString('base64');
+
+    // Send the video as inlineData along with the prompt to the Gemini API
+    const result = await model.generateContent([
+      {
+        inlineData: {
+          mimeType: "video/mp4",
+          data: base64Video,
+        },
+      },
+      { text: prompt },
+    ]);
+
+    const response = await result.response;
+    return response.text();
+  } catch (error: any) {
+    throw new Error(`Gemini API error: ${error.message}`);
+  }
+}
+
+/**
+ * Handles all FFmpeg and Gemini tool requests
  */
 export async function handleToolCall(toolName: string, args: any) {
   switch (toolName) {
@@ -55,6 +100,23 @@ export async function handleToolCall(toolName: string, args: any) {
           text: info
         }]
       };
+    }
+
+    case "analyze_video": {
+      const filePath = validatePath(String(args?.filePath), true);
+      const prompt = args?.prompt ? String(args?.prompt) : "Describe the contents of this video in detail.";
+
+      try {
+        const analysisResult = await analyzeVideoWithGemini(filePath, prompt);
+        return {
+          content: [{
+            type: "text",
+            text: `Video analysis: ${analysisResult}`
+          }]
+        };
+      } catch (error: any) {
+        throw new Error(`Failed to analyze video: ${error.message}`);
+      }
     }
 
     case "convert_video": {
@@ -172,7 +234,6 @@ export async function handleToolCall(toolName: string, args: any) {
           break;
       }
       
-      // Improved command with better handling of watermark opacity and format
       const command = `-i "${inputPath}" -i "${watermarkPath}" -filter_complex "[1:v]format=rgba,colorchannelmixer=aa=${opacity}[watermark];[0:v][watermark]overlay=${overlayPosition}:format=auto,format=yuv420p" -codec:a copy "${outputPath}" -y`;
       const result = await runFFmpegCommand(command);
       
@@ -194,23 +255,17 @@ export async function handleToolCall(toolName: string, args: any) {
       
       await ensureDirectoryExists(outputPath);
       
-      // Build the FFmpeg command
       let command = `-i "${inputPath}" -ss ${startTime}`;
-      
-      // Add duration or end time if provided
       if (duration) {
         command += ` -t ${duration}`;
       } else if (endTime) {
         command += ` -to ${endTime}`;
       }
-      
-      // Add format if specified, otherwise use copy codec
       if (format) {
         command += ` -acodec ${format}`;
       } else {
         command += ` -acodec copy`;
       }
-      
       command += ` "${outputPath}" -y`;
       
       const result = await runFFmpegCommand(command);
@@ -232,38 +287,25 @@ export async function handleToolCall(toolName: string, args: any) {
       const startTime = args?.startTime ? String(args?.startTime) : "";
       const duration = args?.duration ? String(args?.duration) : "";
       
-      // Create output directory if it doesn't exist
       await ensureDirectoryExists(join(outputDir, "dummy.txt"));
       
-      // Build the FFmpeg command
       let command = `-i "${inputPath}"`;
-      
-      // Add start time if provided
       if (startTime) {
         command += ` -ss ${startTime}`;
       }
-      
-      // Add duration if provided
       if (duration) {
         command += ` -t ${duration}`;
       }
-      
-      // Set frame extraction rate
       command += ` -vf "fps=${frameRate}"`;
       
-      // Set quality based on format
       if (format.toLowerCase() === "jpg" || format.toLowerCase() === "jpeg") {
-        // For JPEG, use a better quality setting (lower values = higher quality in FFmpeg's scale)
-        // Convert 1-100 scale to FFmpeg's 1-31 scale (inverted, where 1 is best quality)
         const ffmpegQuality = Math.max(1, Math.min(31, Math.round(31 - ((quality / 100) * 30))));
         command += ` -q:v ${ffmpegQuality}`;
       } else if (format.toLowerCase() === "png") {
-        // For PNG, use compression level (0-9, where 0 is no compression)
         const compressionLevel = Math.min(9, Math.max(0, Math.round(9 - ((quality / 100) * 9))));
         command += ` -compression_level ${compressionLevel}`;
       }
       
-      // Set output pattern with 5-digit numbering
       const outputPattern = join(outputDir, `%05d.${format}`);
       command += ` "${outputPattern}" -y`;
       
@@ -318,11 +360,7 @@ export async function handleToolCall(toolName: string, args: any) {
         audioFilters.push(`afade=t=in:st=0:d=${fadeInDuration}`);
       }
       
-      // For fade-out, we need the video duration, but we don't have a direct equivalent to Python's get_video_duration.
-      // Assume fade-out is applied at the end; user must ensure durations are appropriate.
       if (fadeOutDuration > 0) {
-        // Note: Without duration, we can't compute fade-out start time accurately.
-        // In a production environment, you'd need to extract duration using ffprobe.
         videoFilters.push(`fade=t=out:d=${fadeOutDuration}`);
         audioFilters.push(`afade=t=out:d=${fadeOutDuration}`);
       }
@@ -356,7 +394,6 @@ export async function handleToolCall(toolName: string, args: any) {
       
       await ensureDirectoryExists(outputPath);
       
-      // Create a temporary file listing the input files
       const tempFilePath = join("temp_concat_list.txt");
       const fileList = inputPaths.map(path => `file '${path}'`).join("\n");
       writeFileSync(tempFilePath, fileList);
@@ -673,11 +710,9 @@ export async function handleToolCall(toolName: string, args: any) {
         currentFile = tempOutput;
       }
       
-      // Final step: Ensure the output is compatible by re-encoding if necessary
       const finalCommand = `-i "${currentFile}" -c:v libx264 -preset medium -profile:v baseline -pix_fmt yuv420p -c:a aac "${outputPath}" -y`;
       await runFFmpegCommand(finalCommand);
       
-      // Clean up temporary files
       for (const tempFile of tempFiles) {
         if (existsSync(tempFile)) {
           unlinkSync(tempFile);
@@ -693,7 +728,7 @@ export async function handleToolCall(toolName: string, args: any) {
     }
 
     case "list_filter_templates": {
-      const filtersDir = join("E:", "mcpffmpeg", "src", "filters"); // Absolute path to filters directory
+      const filtersDir = join("E:", "mcpffmpeg", "src", "filters");
       if (!existsSync(filtersDir)) {
         return {
           content: [{
@@ -721,7 +756,6 @@ export async function handleToolCall(toolName: string, args: any) {
       const endTime = String(args?.endTime);
       const outputPath = validatePath(String(args?.outputPath));
       
-      // Validate startTime and endTime by converting to seconds
       const startSec = parseTimeToSeconds(startTime);
       const endSec = parseTimeToSeconds(endTime);
       
@@ -733,24 +767,20 @@ export async function handleToolCall(toolName: string, args: any) {
       
       const tempFiles: string[] = [];
       try {
-        // Step 1: Extract the part before the segment (0 to startTime)
         const part1Path = "temp_part1.mp4";
         tempFiles.push(part1Path);
         const part1Command = `-i "${inputPath}" -ss 0 -t ${startTime} -c:v libx264 -preset medium -profile:v baseline -pix_fmt yuv420p -c:a aac "${part1Path}" -y`;
         await runFFmpegCommand(part1Command);
         
-        // Step 2: Extract the part after the segment (endTime to end)
         const part2Path = "temp_part2.mp4";
         tempFiles.push(part2Path);
         const part2Command = `-i "${inputPath}" -ss ${endTime} -c:v libx264 -preset medium -profile:v baseline -pix_fmt yuv420p -c:a aac "${part2Path}" -y`;
         await runFFmpegCommand(part2Command);
         
-        // Step 3: Check if both parts were created successfully
         if (!existsSync(part1Path) || !existsSync(part2Path)) {
           throw new Error("Failed to create one or both video segments");
         }
         
-        // Step 4: Concatenate the two parts
         const concatListPath = "temp_concat_list.txt";
         tempFiles.push(concatListPath);
         const concatList = `file '${part1Path}'\nfile '${part2Path}'`;
@@ -766,7 +796,6 @@ export async function handleToolCall(toolName: string, args: any) {
           }]
         };
       } finally {
-        // Clean up temporary files
         for (const tempFile of tempFiles) {
           if (existsSync(tempFile)) {
             unlinkSync(tempFile);

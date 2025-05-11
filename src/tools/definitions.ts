@@ -553,5 +553,23 @@ export const toolDefinitions = [
       },
       required: ["inputPath", "startTime", "endTime", "outputPath"]
     }
+  },
+  {
+    name: "analyze_video",
+    description: "Analyze a video file using Gemini to describe its contents",
+    inputSchema: {
+      type: "object",
+      properties: {
+        filePath: {
+          type: "string",
+          description: "Path to the video file"
+        },
+        prompt: {
+          type: "string",
+          description: "Optional prompt to guide the analysis (e.g., 'What's in this video?')"
+        }
+      },
+      required: ["filePath"]
+    }
   }
 ];

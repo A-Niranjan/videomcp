@@ -16,7 +16,9 @@
     "inspector": "npx @modelcontextprotocol/inspector build/index.js"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "0.6.0",
+    "dotenv": "^16.5.0",
     "ffmpeg": "^0.0.4"
   },
   "devDependencies": {
