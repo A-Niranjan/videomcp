@@ -247,6 +247,50 @@ async function removeEventSegments(inputPath: string, eventDescription: string, 
 }
 
 /**
+ * Automatically removes segments of a video where a specified event occurs
+ * @param inputPath Path to the input video
+ * @param eventDescription Description of the event to remove (e.g., "the dog barks")
+ * @param outputPath Path for the output video
+ */
+async function deleteEventSegments(inputPath: string, eventDescription: string, outputPath: string) {
+  const validatedInputPath = validatePath(inputPath, true);
+  let validatedOutputPath = validatePath(outputPath);
+
+  // Check if outputPath is a directory (doesn't end with a file extension like .mp4)
+  const pathIsDirectory = !validatedOutputPath.match(/\.(mp4|avi|mov|mkv|webm)$/i);
+  if (pathIsDirectory) {
+    // If it's a directory, append a default file name based on the input file name
+    const inputFileName = validatedInputPath.split('\\').pop()?.replace(/\.[^/.]+$/, "") || "video";
+    validatedOutputPath = join(validatedOutputPath, `${inputFileName}_edited.mp4`);
+  }
+
+  // Let ensureDirectoryExists handle the parent directory creation
+  await ensureDirectoryExists(validatedOutputPath);
+
+  try {
+    // Step 1: Analyze video with Gemini to get the timestamps of the event to REMOVE
+    const prompt = `Identify all segments in the video where the following event occurs: "${eventDescription}". Provide the start and end timestamps in HH:MM:SS format for each segment. If the event occurs multiple times, list all occurrences with their respective timestamps.`;
+    const geminiResponse = await analyzeVideoWithGemini(validatedInputPath, prompt);
+
+    // Step 2: Extract timestamps of the event to remove
+    const segmentsToRemove = extractTimestampsFromResponse(geminiResponse);
+
+    // Step 3: Remove the specified segments
+    if (segmentsToRemove.length > 0) {
+      await removeSegments(validatedInputPath, segmentsToRemove, validatedOutputPath);
+    } else {
+      // If no segments to remove, just copy the input to output
+      const command = `-i "${validatedInputPath}" -c copy "${validatedOutputPath}" -y`;
+      await runFFmpegCommand(command);
+    }
+
+    return `Successfully removed segments for event "${eventDescription}" from ${inputPath}. Output saved to ${validatedOutputPath}`;
+  } catch (error: any) {
+    throw new Error(`Failed to process video: ${error.message}`);
+  }
+}
+
+/**
  * Handles all FFmpeg and Gemini tool requests
  */
 export async function handleToolCall(toolName: string, args: any) {
@@ -294,6 +338,24 @@ export async function handleToolCall(toolName: string, args: any) {
         };
       } catch (error: any) {
         throw new Error(`Failed to remove event segments: ${error.message}`);
+      }
+    }
+
+    case "delete_event_segments": {
+      const inputPath = validatePath(String(args?.inputPath), true);
+      const eventDescription = String(args?.eventDescription);
+      const outputPath = validatePath(String(args?.outputPath));
+
+      try {
+        const result = await deleteEventSegments(inputPath, eventDescription, outputPath);
+        return {
+          content: [{
+            type: "text",
+            text: result
+          }]
+        };
+      } catch (error: any) {
+        throw new Error(`Failed to delete event segments: ${error.message}`);
       }
     }
 

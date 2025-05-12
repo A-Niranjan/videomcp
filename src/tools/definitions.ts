@@ -574,7 +574,29 @@ export const toolDefinitions = [
   },
   {
     name: "remove_event_segments",
-    description: "Automatically remove segments from a video where a specific event occurs, identified using Gemini analysis",
+    description: "Automatically keep the segment of a video where a specific event occurs, identified using Gemini analysis",
+    inputSchema: {
+      type: "object",
+      properties: {
+        inputPath: {
+          type: "string",
+          description: "Path to the input video file"
+        },
+        eventDescription: {
+          type: "string",
+          description: "Description of the event to keep (e.g., 'the goalkeeper saves the penalty kick')"
+        },
+        outputPath: {
+          type: "string",
+          description: "Path for the output video file"
+        }
+      },
+      required: ["inputPath", "eventDescription", "outputPath"]
+    }
+  },
+  {
+    name: "delete_event_segments",
+    description: "Automatically remove segments from a video where a specific event occurs, identified using Gemini analysis, and keep the remaining segments",
     inputSchema: {
       type: "object",
       properties: {
