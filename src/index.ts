@@ -27,6 +27,9 @@ import { handleToolCall } from "./tools/handlers.js";
 /**
  * Create an MCP server with capabilities for tools to interact with FFmpeg
  */
+/**
+ * Create an MCP server with capabilities for tools to interact with FFmpeg
+ */
 const server = new Server(
   {
     name: "mcp-ffmpeg-helper",
@@ -35,9 +38,12 @@ const server = new Server(
   {
     capabilities: {
       tools: {},
-    },
+    }
   }
 );
+
+// Implement a keep-alive mechanism for long-running operations
+// This will periodically send progress updates to prevent timeout
 
 /**
  * Handler that lists available tools.

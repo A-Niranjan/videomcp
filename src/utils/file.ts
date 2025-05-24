@@ -7,6 +7,12 @@ import { mkdir } from "fs/promises";
  */
 export async function ensureDirectoryExists(filePath: string): Promise<void> {
   const dir = dirname(filePath);
+  
+  // Skip directory creation for drive roots (e.g., "E:\")
+  if (dir.match(/^[A-Za-z]:\\?$/)) {
+    return; // Drive root already exists, no need to create
+  }
+  
   try {
     await mkdir(dir, { recursive: true });
   } catch (error) {

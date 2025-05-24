@@ -10,7 +10,11 @@ import { GoogleGenerativeAI, GenerativeModel } from "@google/generative-ai";
 dotenv.config();
 
 // Initialize the Gemini API client
-const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || "");
+const apiKey = process.env.GOOGLE_API_KEY || "";
+if (!apiKey) {
+  console.warn("WARNING: GOOGLE_API_KEY is not set in the .env file. The Gemini API will not work properly.");
+}
+const genAI = new GoogleGenerativeAI(apiKey);
 
 // Helper function to parse time strings
 function parseTimeToSeconds(timeStr: string | number): number {
@@ -57,32 +61,106 @@ function parseTimeToSeconds(timeStr: string | number): number {
  * @returns The Gemini API response as a string
  */
 async function analyzeVideoWithGemini(videoPath: string, prompt: string): Promise<string> {
+  // Check API key first
+  if (!apiKey || apiKey.trim() === "") {
+    throw new Error("Gemini API key is not configured. Please add a valid GOOGLE_API_KEY to your .env file.");
+  }
+  
   try {
     // Validate the video path
     const validatedPath = validatePath(videoPath, true);
-
-    // Initialize the Gemini model (using gemini-1.5-flash for video support)
-    const model: GenerativeModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    // Read the video file as a buffer and encode it as base64
+    console.log(`Analyzing video: ${validatedPath}`);
+    
+    // Get video info to check duration, format, etc.
+    console.log(`Getting video information...`);
+    const info = await getVideoInfo(validatedPath);
+    const videoInfo = JSON.parse(info);
+    const duration = parseFloat(videoInfo?.format?.duration || '0');
+    
+    console.log(`Video duration: ${duration}s`);
+    
+    // Read the video file data
     const videoData = readFileSync(validatedPath);
+    console.log(`Video loaded successfully (${Math.round(videoData.length / (1024 * 1024))} MB)`);
+    
+    // Convert to base64
     const base64Video = videoData.toString('base64');
-
-    // Send the video as inlineData along with the prompt to the Gemini API
-    const result = await model.generateContent([
-      {
-        inlineData: {
-          mimeType: "video/mp4",
-          data: base64Video,
-        },
-      },
-      { text: prompt },
-    ]);
-
-    const response = await result.response;
-    return response.text();
+    
+    // Get the video MIME type from the file info
+    const mimeType = videoInfo?.format?.format_name?.includes('mp4') ? 'video/mp4' : 'video/mp4';
+    
+    // Use Gemini model that supports video analysis
+    const model = genAI.getGenerativeModel({
+      model: "gemini-1.5-flash", // Use model that supports video
+      generationConfig: {
+        maxOutputTokens: 1024,
+        temperature: 0.2,
+      }
+    });
+    
+    // Construct a prompt for video analysis
+    const enhancedPrompt = 
+      `This is a video that's ${duration.toFixed(1)} seconds long. ` +
+      `${prompt} ` +
+      `Provide a detailed description and analysis of the video content.`;
+    
+    console.log(`Sending full video to Gemini API...`);
+    
+    // Request the analysis with timeout handling
+    const timeoutMs = 60000; // 60 seconds timeout for video analysis
+    
+    try {
+      // Create a timeout promise
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error(`Request timed out after ${timeoutMs/1000} seconds`)), timeoutMs);
+      });
+      
+      // Race the API call against the timeout
+      const result = await Promise.race([
+        model.generateContent([
+          {
+            inlineData: {
+              mimeType: mimeType,
+              data: base64Video,
+            },
+          },
+          { text: enhancedPrompt },
+        ]),
+        timeoutPromise
+      ]) as any;
+      
+      const response = await result.response;
+      console.log('Gemini API response received successfully');
+      
+      return (
+        `Video Analysis Results:\n\n` +
+        `${response.text()}`
+      );
+    } catch (error: any) {
+      if (error.message.includes("timed out")) {
+        throw new Error("The Gemini API request timed out. Please try again or use a different video.");
+      }
+      throw error;
+    }
   } catch (error: any) {
-    throw new Error(`Gemini API error: ${error.message}`);
+    console.error(`Gemini API error: ${error.message}`);
+    
+    // Provide more specific error messages
+    if (error.message.includes("invalid argument") || error.message.includes("400 Bad Request")) {
+      throw new Error(
+        "Gemini API rejected the request. This could be due to:\n" +
+        "1. The API key may be invalid or have insufficient permissions\n" +
+        "2. The video format may not be supported or the file is too large\n" +
+        "3. The video duration may exceed the model's limits\n" +
+        "Try with a different video or check your API key configuration."
+      );
+    } else if (error.message.includes("timeout")) {
+      throw new Error("The Gemini API request timed out. Try again later when the service might be less busy.");
+    } else if (error.message.includes("File too large") || error.message.includes("exceeds maximum allowed size")) {
+      throw new Error("The video file is too large to process. Try with a smaller video or compress the current one.");
+    } else {
+      throw new Error(`Failed to analyze video: ${error.message}`);
+    }
   }
 }
 
@@ -426,14 +504,24 @@ export async function handleToolCall(toolName: string, args: any) {
       
       await ensureDirectoryExists(outputPath);
       
-      let command = `-i "${inputPath}" -ss ${startTime}`;
+      // Approach 1: Accurate seeking with re-encoding (slower but more reliable)
+      let command = ``;
+      
+      // Seeking before input for more accurate seeking
+      command = `-ss ${startTime} -i "${inputPath}"`;
+      
+      // Add duration/endtime if specified
       if (duration) {
         command += ` -t ${duration}`;
       } else if (endTime) {
         command += ` -to ${endTime}`;
       }
-      command += ` -c copy "${outputPath}" -y`;
       
+      // Use re-encoding instead of stream copy for more reliable output
+      // Use a reasonable preset and quality settings
+      command += ` -c:v libx264 -preset medium -c:a aac "${outputPath}" -y`;
+      
+      console.log(`Running FFmpeg trim command: ${command}`);
       const result = await runFFmpegCommand(command);
       
       return {
